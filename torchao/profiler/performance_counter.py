@@ -154,7 +154,7 @@ class PerformanceTimer:
     Context manager that records the latency, io, and flops of a torch operator / module.
 
     Timing is done using `time.perf_counter` and can be overridden to use a different
-    timer (see `CUDAPerformanceTimer`).
+    timer (see `CUDAPerformanceTimer` and `XPUPerformanceTimer`).
 
     IO and FLOPs are recorded using `PerformanceCounterMode`.
 
@@ -244,6 +244,32 @@ class CUDAPerformanceTimer(PerformanceTimer):
     def __exit__(self, type, value, traceback):
         self.end.record()
         torch.cuda.synchronize()
+        # Convert from ms to s
+        self.latency = self.start.elapsed_time(self.end) * 1e-3
+        self.perf_counter.__exit__(type, value, traceback)
+
+        if self.display:
+            self._print_exit_msg()
+
+
+class XPUPerformanceTimer(PerformanceTimer):
+    """
+    `PerformanceTimer` that uses `xpuEvents` to record latency.
+    """
+
+    def __enter__(self):
+        self.start = torch.xpu.Event(enable_timing=True)
+        self.end = torch.xpu.Event(enable_timing=True)
+        self.start.record()
+        self.perf_counter = PerformanceCounterMode(
+            display=self.display, depth=self.depth
+        )
+        self.perf_counter.__enter__()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.end.record()
+        torch.xpu.synchronize()
         # Convert from ms to s
         self.latency = self.start.elapsed_time(self.end) * 1e-3
         self.perf_counter.__exit__(type, value, traceback)

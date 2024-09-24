@@ -210,12 +210,32 @@ _AVAILABLE_GPU_SPECS: Dict[str, Dict[Union[str, torch.dtype], float]] = {
         torch.float32: 16.4e12,
         torch.float16: 130e12,
     },
+    # Intel Max
+    # source:
+    # TODO: check number & reference link
+    "max 1550": {
+        torch.float64: 54.423e12,
+        torch.float32: 29.491e12,
+        torch.bfloat16: 832e12,
+        torch.float16: 832e12,
+        torch.int8: 1664e12,
+    },
+    "max 1100": {
+        torch.float64: 22.221e12,
+        torch.float32: 14.336e12,
+        torch.bfloat16: 352e12,
+        torch.float16: 352e12,
+        torch.int8: 668e12,
+    },
 }
 
 
 # Adapted from https://github.com/Lightning-AI/pytorch-lightning/blob/master/src/lightning/fabric/utilities/throughput.py
-def get_chip_name(device: int = 0) -> str:
-    device_name = torch.cuda.get_device_name(device)
+def get_chip_name(device_type: str = "cuda", device: int = 0) -> str:
+    if "cuda" in device_type:
+        device_name = torch.cuda.get_device_name(device)
+    elif "xpu" in device_type:
+        device_name = torch.xpu.get_device_name(device)
     chip = device_name.lower()
 
     if "h100" in chip:
@@ -255,13 +275,20 @@ def get_chip_name(device: int = 0) -> str:
         chip = "v100 pcie"
     elif "v100s-pcie" in chip:
         chip = "v100s pcie"
+    elif "max 1550" in chip:
+        chip = "max 1550"
+    elif "max 1100" in chip:
+        chip = "max 1100"
     else:
         chip = None
     return chip
 
 
-def get_vram(device: int = 0) -> int:
-    device_props = torch.cuda.get_device_properties(device)
+def get_vram(device_type: str = "cuda", device: int = 0) -> int:
+    if "cuda" in device_type:
+        device_props = torch.cuda.get_device_properties(device)
+    else:
+        device_props = torch.xpu.get_device_properties(device)
     return device_props.total_memory
 
 
@@ -392,7 +419,7 @@ class CUDADeviceSpec(DeviceSpec):
 
         # FLOPs / s
         if self.flops_per_s is None:
-            chip_name = get_chip_name(self.device)
+            chip_name = get_chip_name(self.device_type, self.device)
             if chip_name is None:
                 print(f"No FLOPs data available for device name {self.name}")
             else:
@@ -415,7 +442,65 @@ class CUDADeviceSpec(DeviceSpec):
                     )
         # Vram
         if self.vram is None:
-            self.vram = get_vram()
+            self.vram = get_vram(self.device_type)
+
+        # Issue post check warnings
+        self._post_init_check()
+
+
+@dataclass
+class XPUDeviceSpec(DeviceSpec):
+    """
+    XPU specs for theoretical peak performance, conformant with DeviceSpec interface.
+
+    Fields will be auto-populated in __post_init__ if not specified
+    and if data is available.
+
+    See _AVAILABLE_GPU_SPECS for a list of available chip data.
+
+    Fields and expected units:
+        - device (int): XPU device index
+        - name (str): name of the device
+        - bandwidth (bytes /s): memory bandwidth in bytes / s
+        - flops_per_s (FLOP / s): FLOPs per second
+        - vram (bytes): VRAM in bytes
+        - dtype (torch.dtype): dtype used for theoretical peak performance
+        - flops_by_dtype (dict[Union[torch.dtype, str], float]): mapping from dtype to FLOP / s
+    """
+
+    device_type: str = "xpu"
+    # Device index
+    device: Optional[int] = 0
+
+    def __post_init__(self):
+        # Populate fields if not already populated
+        self.name = torch.xpu.get_device_name(self.device)
+
+        # Memory bandwidth in bytes / s
+        if self.bandwidth is None:
+            self.bandwidth = get_bandwidth()
+
+        # FLOPs / s
+        if self.flops_per_s is None:
+            chip_name = get_chip_name(self.device_type, self.device)
+            if chip_name is None:
+                print(f"No FLOPs data available for device name {self.name}")
+            else:
+                flops_by_dtype = get_flops_by_dtype(chip_name)
+                if flops_by_dtype is not None:
+                    self.flops_by_dtype.update(flops_by_dtype)
+
+                # Populate flops if not already populated
+                if flops_by_dtype is not None and self.dtype in flops_by_dtype:
+                    self.flops_per_s = flops_by_dtype[self.dtype]
+
+                else:
+                    print(
+                        f"Could not find FLOPs for dtype {self.dtype} for device {self.name}"
+                    )
+        # Vram
+        if self.vram is None:
+            self.vram = get_vram(self.device_type)
 
         # Issue post check warnings
         self._post_init_check()

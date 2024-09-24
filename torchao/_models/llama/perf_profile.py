@@ -120,6 +120,7 @@ from torchao._models.llama.model import Transformer
 from torchao._models.llama.tokenizer import get_tokenizer
 from torchao.profiler import (
     CUDADeviceSpec,
+    XPUDeviceSpec,
     TransformerPerformanceCounter,
     total_model_params,
 )
@@ -131,9 +132,13 @@ GPT_FAST_PREFIX = "GPTFast"
 DELIMITER = "\n" + "=" * 30 + "\n"
 
 
+default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 def device_sync(device):
     if "cuda" in device:
         torch.cuda.synchronize(device)
+    elif "xpu" in device:
+        torch.xpu.synchronize(device)
     elif ("cpu" in device) or ("mps" in device):
         pass
     else:
@@ -327,7 +332,10 @@ def main(
     global DEVICE_SPEC
     global PERF_COUNTER
 
-    DEVICE_SPEC = CUDADeviceSpec(dtype=precision)
+    if "cuda" in device:
+        DEVICE_SPEC = CUDADeviceSpec(dtype=precision)
+    elif "xpu" in device:
+        DEVICE_SPEC = XPUDeviceSpec(dtype=precision)
     PERF_COUNTER = TransformerPerformanceCounter(depth=3, device_spec=DEVICE_SPEC)
     print(DELIMITER)
     print(f"{PERF_COUNTER_PREFIX}")
@@ -386,10 +394,14 @@ def main(
 
     # First print aggregate stats from original gpt-fast script
     print(DELIMITER)
+    if "cuda" in device:
+        mem = torch.cuda.max_memory_reserved() / 1e9
+    elif "xpu" in device:
+        mem = torch.xpu.max_memory_reserved() / 1e9
     gpt_stats = textwrap.dedent(f"""\
         {GPT_FAST_PREFIX} Aggregate Stats
         Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}
-        Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB""")
+        Memory used: {mem:.02f} GB""")
 
     print(
         textwrap.indent(
@@ -437,6 +449,12 @@ if __name__ == "__main__":
         type=Path,
         default=Path("performance_stats.json"),
         help="Path to save performance stats.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=default_device,
+        help='Device to use'
     )
     args = parser.parse_args()
     main(**vars(args))
