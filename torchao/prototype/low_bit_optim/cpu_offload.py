@@ -2,6 +2,12 @@ from typing import Type
 
 import torch
 from torch.optim.optimizer import Optimizer, ParamsT
+# TODO: port aten::record_stream from IPEX to PyTorch
+try:
+    if torch.xpu.is_available():
+        import intel_extension_for_pytorch as ipex
+except:
+    print("Unable to import IPEX")
 
 from torchao.utils import TORCH_VERSION_AT_LEAST_2_4
 
@@ -13,6 +19,7 @@ class CPUOffloadOptimizer:
         optimizer_class: Type[Optimizer] = torch.optim.AdamW,
         *,
         offload_gradients: bool = False,
+        device: str = "cuda",
         **kwargs,
     ) -> None:
         """Offload optimizer to CPU for single-GPU training. This will reduce GPU memory by the size of optimizer state.
@@ -22,6 +29,7 @@ class CPUOffloadOptimizer:
             params: a list of parameters or parameter groups.
             optimizer_class: constructor of the base optimizer. Defaults to :class:`torch.optim.AdamW`.
             offload_gradients: free GPU gradients once they are moved to CPU. Not compatible with gradient accumulation.
+            device: device type for GPU. Choose from "cuda" and "xpu". Defaults to "cuda".
             kwargs: other keyword arguments to be passed to the base optimizer e.g. `lr`, `weight_decay`.
         """
         # default to fused CPU AdamW
@@ -34,47 +42,56 @@ class CPUOffloadOptimizer:
         if not isinstance(param_groups[0], dict):
             param_groups = [{"params": param_groups}]
 
-        self.param_cuda2cpu_map = dict()
+        self.param_d2h_map = dict()
         self.optim_dict = dict()
-        self.stream = torch.cuda.Stream()
+        self.device = device
+        if self.device == "cuda":
+            self.stream = torch.cuda.Stream()
+        elif self.device == "xpu":
+            self.stream = torch.xpu.Stream()
 
         # the queue maintains the order which param we should do optim step on first.
         self.queue = dict()
 
-        def backward_hook(p_cuda):
-            if p_cuda.grad is not None:
-                p_cpu = self.param_cuda2cpu_map[p_cuda]
+        def backward_hook(p_device):
+            if p_device.grad is not None:
+                p_host = self.param_d2h_map[p_device]
 
                 # make sure backward for this param finishes
-                self.stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(self.stream):
-                    p_cpu.grad.copy_(p_cuda.grad, non_blocking=True)
+                if self.device == "cuda":
+                    self.stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(self.stream):
+                        p_host.grad.copy_(p_device.grad, non_blocking=True)
+                elif self.device == "xpu":
+                    self.stream.wait_stream(torch.xpu.current_stream())
+                    with torch.xpu.stream(self.stream):
+                        p_host.grad.copy_(p_device.grad, non_blocking=True)
 
                 # we rely on CPython implementation of dictionary, which preserves insertion order.
                 # if a param is added again (e.g. due to gradient accumulation), it is moved to the
                 # end of the queue by removing and inserting it again.
-                if p_cuda in self.queue:
-                    del self.queue[p_cuda]
-                self.queue[p_cuda] = self.stream.record_event()
+                if p_device in self.queue:
+                    del self.queue[p_device]
+                self.queue[p_device] = self.stream.record_event()
 
-                # deallocate CUDA gradients once D2H transfer finishes.
+                # deallocate DEVICE gradients once D2H transfer finishes.
                 if offload_gradients:
-                    p_cuda.grad.record_stream(self.stream)
-                    p_cuda.grad = None
+                    p_device.grad.record_stream(self.stream)
+                    p_device.grad = None
 
         for param_group in param_groups:
             params = param_group.pop("params")
 
-            for p_cuda in params:
+            for p_device in params:
                 # pre-allocate CPU params and grads
-                p_cpu = torch.empty_like(p_cuda, device="cpu", pin_memory=True)
-                p_cpu.grad = torch.empty_like(p_cpu, pin_memory=True)
+                p_host = torch.empty_like(p_device, device="cpu", pin_memory=True)
+                p_host.grad = torch.empty_like(p_host, pin_memory=True)
 
-                p_cpu.copy_(p_cuda.detach(), non_blocking=True)
-                self.param_cuda2cpu_map[p_cuda] = p_cpu
+                p_host.copy_(p_device.detach(), non_blocking=True)
+                self.param_d2h_map[p_device] = p_host
 
-                p_cuda.register_post_accumulate_grad_hook(backward_hook)
-                self.optim_dict[p_cuda] = optimizer_class([{"params": p_cpu, **param_group}], **kwargs)
+                p_device.register_post_accumulate_grad_hook(backward_hook)
+                self.optim_dict[p_device] = optimizer_class([{"params": p_host, **param_group}], **kwargs)
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -82,16 +99,20 @@ class CPUOffloadOptimizer:
         if closure is not None:
             loss = closure()
 
-        for p_cuda, grad_d2h_event in self.queue.items():
+        for p_device, grad_d2h_event in self.queue.items():
             grad_d2h_event.synchronize()
-            self.optim_dict[p_cuda].step()
+            self.optim_dict[p_device].step()
 
             # submit more job to self.stream. it guarantees that we only start
             # moving param H2D once all backwards finish, since self.stream
             # will wait for current_stream when moving grad D2H.
-            p_cpu = self.param_cuda2cpu_map[p_cuda]
-            with torch.cuda.stream(self.stream):
-                p_cuda.copy_(p_cpu, non_blocking=True)
+            p_host = self.param_d2h_map[p_device]
+            if self.device == "cuda":
+                with torch.cuda.stream(self.stream):
+                    p_device.copy_(p_host, non_blocking=True)
+            elif self.device == "xpu":
+                with torch.xpu.stream(self.stream):
+                    p_device.copy_(p_host, non_blocking=True)
 
         self.queue.clear()
         return loss
@@ -99,9 +120,9 @@ class CPUOffloadOptimizer:
     def zero_grad(self, set_to_none=True):
         assert set_to_none
 
-        # only clear CUDA grad. CPU grad will always be overwritten by CUDA grad.
-        for p_cuda in self.param_cuda2cpu_map.keys():
-            p_cuda.grad = None
+        # only clear DEVICE grad. CPU grad will always be overwritten by DEVICE grad.
+        for p_device in self.param_d2h_map.keys():
+            p_device.grad = None
 
     @property
     def param_groups(self):
